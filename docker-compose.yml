@@ -1,0 +1,103 @@
+# Environment shared by every PHP container. These override the values in .env
+# so the app talks to the Postgres/Redis services no matter what the developer's
+# local .env points at.
+x-app-env: &app-env
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_DATABASE: ${DB_DATABASE:-scrappy}
+  DB_USERNAME: ${DB_USERNAME:-scrappy}
+  DB_PASSWORD: ${DB_PASSWORD:-secret}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  QUEUE_CONNECTION: redis
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+
+services:
+  app:
+    build:
+      context: .
+      target: app
+    image: scrappy-app
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CONTAINER_ROLE: app
+    env_file:
+      - .env
+    volumes:
+      - storage:/var/www/html/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  nginx:
+    build:
+      context: .
+      target: web
+    image: scrappy-web
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8000}:80"
+    depends_on:
+      - app
+
+  worker:
+    image: scrappy-app
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CONTAINER_ROLE: worker
+    env_file:
+      - .env
+    volumes:
+      - storage:/var/www/html/storage
+    depends_on:
+      app:
+        condition: service_started
+    # Scale probe throughput by raising the replica count (bounds concurrency).
+    deploy:
+      replicas: ${WORKER_REPLICAS:-2}
+
+  scheduler:
+    image: scrappy-app
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      CONTAINER_ROLE: scheduler
+    env_file:
+      - .env
+    volumes:
+      - storage:/var/www/html/storage
+    depends_on:
+      app:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-scrappy}
+      POSTGRES_USER: ${DB_USERNAME:-scrappy}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-scrappy} -d ${DB_DATABASE:-scrappy}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:
+  storage:
