@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { Head, router } from '@inertiajs/vue3';
-import { useStream } from '@laravel/stream-vue';
 import {
     Check,
     ChevronDown,
@@ -31,6 +30,7 @@ import {
     SelectTrigger,
     SelectValue,
 } from '@/components/ui/select';
+import { useChatStream } from '@/composables/useChatStream';
 import { index as chatIndex, stream as chatStream } from '@/routes/chat';
 import {
     clear as clearConversations,
@@ -174,39 +174,54 @@ watch(
     },
 );
 
-const { isStreaming, isFetching, send, cancel } = useStream(chatStream().url, {
-    // A brand new conversation announces its id in the response headers.
-    onResponse: (response: Response) => {
-        const id = response.headers.get('X-Conversation-Id');
+/**
+ * The bubble the reply in flight is being written into.
+ *
+ * Chunks are routed by reference rather than by "whichever message looks
+ * pending", so a reply can never land in a thread the reader has already moved
+ * on from — and nothing is written once the exchange has been closed off.
+ */
+let target: Message | null = null;
 
-        if (id) {
+/** Whether the open conversation was created by the reply in flight. */
+let adoptedConversation = false;
+
+const { isStreaming, isFetching, send, cancel } = useChatStream(
+    chatStream().url,
+    {
+        // A brand new conversation announces its id in the response headers.
+        onResponse: (response: Response) => {
+            const id = response.headers.get('X-Conversation-Id');
+
+            if (target === null || !id) {
+                return;
+            }
+
+            adoptedConversation = conversationId.value === null;
             conversationId.value = Number(id);
-        }
-    },
-    // Chunks land in a plain buffer and are written to the reactive message
-    // once per frame. Writing on every chunk means a re-render and a forced
-    // layout hundreds of times a reply, which is what makes a fast model feel
-    // slower in the browser than it does on the wire.
-    onData: (chunk: string) => queueChunk(chunk),
-    onFinish: () => {
-        finishPending('done');
+        },
+        // Chunks land in a plain buffer and are written to the reactive message
+        // once per frame. Writing on every chunk means a re-render and a forced
+        // layout hundreds of times a reply, which is what makes a fast model
+        // feel slower in the browser than it does on the wire.
+        onData: queueChunk,
+        onFinish: () => {
+            finishReply('done');
+            syncConversations();
+        },
+        onError: (message: string) => {
+            flushChunks();
 
-        // Pick up a newly created conversation (or an updated timestamp).
-        if (!temporary.value) {
-            router.reload({ only: ['conversations'] });
-        }
-    },
-    onCancel: () => finishPending('done'),
-    onError: () => {
-        const message = pendingMessage();
+            if (target !== null && target.content === '') {
+                target.content = message;
+                forgetDiscardedConversation();
+            }
 
-        if (message && message.content === '') {
-            message.content = 'The endpoint did not respond.';
-        }
-
-        finishPending('error');
+            finishReply('error');
+            syncConversations();
+        },
     },
-});
+);
 
 const busy = computed(() => isStreaming.value || isFetching.value);
 
@@ -223,6 +238,10 @@ let chunkBuffer = '';
 let frame: number | null = null;
 
 function queueChunk(chunk: string) {
+    if (target === null) {
+        return;
+    }
+
     chunkBuffer += chunk;
 
     if (frame === null) {
@@ -237,44 +256,113 @@ function flushChunks() {
         frame = null;
     }
 
-    if (chunkBuffer === '') {
-        return;
-    }
-
-    const message = pendingMessage();
-
-    if (!message) {
-        return;
-    }
-
-    const pending = chunkBuffer;
+    const buffered = chunkBuffer;
     chunkBuffer = '';
 
-    message.status = 'streaming';
-    message.content += pending;
+    if (buffered === '' || target === null) {
+        return;
+    }
+
+    target.status = 'streaming';
+    target.content += buffered;
     stickToBottom();
 }
 
-/** The assistant message currently receiving tokens, if any. */
-function pendingMessage(): Message | null {
-    const last = messages.value[messages.value.length - 1];
-
-    return last?.role === 'assistant' &&
-        (last.status === 'pending' || last.status === 'streaming')
-        ? last
-        : null;
-}
-
-function finishPending(status: 'done' | 'error') {
+/** Close off the reply in flight, and stop routing chunks to it. */
+function finishReply(status: 'done' | 'error') {
     // Anything still buffered belongs in the thread before we mark it finished.
     flushChunks();
 
-    const message = pendingMessage();
-
-    if (message) {
-        message.status = status;
-        message.finishedAt = Date.now();
+    if (target === null) {
+        return;
     }
+
+    target.status = status;
+    target.finishedAt = Date.now();
+    target = null;
+    adoptedConversation = false;
+}
+
+/** Keep whatever has already arrived, and ask for no more of it. */
+function stopStream() {
+    cancel();
+    flushChunks();
+
+    const reply = target;
+
+    // A reply stopped before it started is rolled back rather than kept: the
+    // server discards a prompt it produced nothing for, and takes a
+    // conversation created solely to hold it along too, so keeping the turns
+    // here would leave the thread describing a transcript that does not exist.
+    if (reply !== null && reply.content === '') {
+        rollBackExchange(reply);
+    } else {
+        finishReply('done');
+    }
+
+    syncConversations();
+}
+
+/** Throw the reply in flight away, for when the thread itself is changing. */
+function abandonStream() {
+    chunkBuffer = '';
+    target = null;
+    adoptedConversation = false;
+    cancel();
+}
+
+/**
+ * Drop an exchange the server kept nothing of, handing the prompt back to the
+ * composer so it can be sent somewhere that answers.
+ */
+function rollBackExchange(reply: Message): void {
+    const index = messages.value.indexOf(reply);
+
+    target = null;
+    chunkBuffer = '';
+    forgetDiscardedConversation();
+
+    if (index === -1) {
+        return;
+    }
+
+    const asked = messages.value[index - 1];
+
+    if (asked?.role !== 'user') {
+        messages.value.splice(index, 1);
+
+        return;
+    }
+
+    if (prompt.value === '') {
+        prompt.value = asked.content;
+    }
+
+    messages.value.splice(index - 1, 2);
+}
+
+/**
+ * Stop pointing at a conversation the server has just thrown away, so the next
+ * message opens a fresh one instead of being refused.
+ */
+function forgetDiscardedConversation(): void {
+    if (adoptedConversation) {
+        conversationId.value = null;
+    }
+
+    adoptedConversation = false;
+}
+
+/**
+ * Pull the sidebar back into step: a first message creates a conversation, and
+ * every message moves one up the list.
+ */
+function syncConversations() {
+    if (temporary.value) {
+        return;
+    }
+
+    router.reload({ only: ['conversations'] });
 }
 
 onUnmounted(() => {
@@ -365,6 +453,11 @@ function submit() {
         finishedAt: null,
     });
 
+    // Read the bubble back out of the list rather than keeping the object that
+    // was pushed: `messages` hands out reactive proxies, and writing tokens to
+    // the raw object behind one would never reach the page.
+    target = messages.value[messages.value.length - 1] ?? null;
+
     prompt.value = '';
     pinnedToBottom.value = true;
     stickToBottom();
@@ -381,9 +474,7 @@ function submit() {
 }
 
 function newChat() {
-    if (busy.value) {
-        cancel();
-    }
+    abandonStream();
 
     messages.value = [];
     conversationId.value = null;
@@ -401,9 +492,7 @@ function newChat() {
 }
 
 function openConversation(id: number) {
-    if (busy.value) {
-        cancel();
-    }
+    abandonStream();
 
     temporary.value = false;
 
@@ -423,9 +512,7 @@ function toggleTemporary() {
 
     // Either mode starts from a clean slate: a temporary thread must not
     // inherit a saved transcript, and vice versa.
-    if (busy.value) {
-        cancel();
-    }
+    abandonStream();
 
     messages.value = [];
     conversationId.value = null;
@@ -467,8 +554,8 @@ function saveRename(id: number) {
 function removeConversation(id: number) {
     // Deleting the thread being streamed into would otherwise leave the reply
     // arriving into a bubble that is about to be replaced.
-    if (busy.value && conversationId.value === id) {
-        cancel();
+    if (conversationId.value === id) {
+        abandonStream();
     }
 
     router.delete(destroyConversation(id).url, {
@@ -485,9 +572,7 @@ function removeConversation(id: number) {
 }
 
 function removeAllConversations() {
-    if (busy.value) {
-        cancel();
-    }
+    abandonStream();
 
     router.delete(clearConversations().url, {
         preserveScroll: true,
@@ -840,7 +925,7 @@ async function stickToBottom() {
                         class="max-h-40 min-h-11 flex-1 resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
                         @keydown="onPromptKeydown"
                     />
-                    <Button v-if="busy" variant="secondary" @click="cancel">
+                    <Button v-if="busy" variant="secondary" @click="stopStream">
                         <Square class="h-4 w-4" />
                         Stop
                     </Button>

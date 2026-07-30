@@ -6,10 +6,11 @@
         "build": "vite build",
         "build:ssr": "vite build && vite build --ssr",
         "dev": "vite",
-        "format": "prettier --write resources/",
-        "format:check": "prettier --check resources/",
+        "format": "prettier --write resources/ tests/js/",
+        "format:check": "prettier --check resources/ tests/js/",
         "lint": "eslint . --fix",
         "lint:check": "eslint .",
+        "test:js": "node --test \"tests/js/**/*.test.ts\"",
         "types:check": "vue-tsc --noEmit"
     },
     "devDependencies": {

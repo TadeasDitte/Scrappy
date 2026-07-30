@@ -237,15 +237,27 @@ class OllamaClient
             ->withOptions(['stream' => true])
             ->post($domain->baseUrl().$path, $payload);
 
-        $body = $response->toPsrResponse()->getBody();
-        $buffer = '';
+        $stream = $response->toPsrResponse()->getBody()->detach();
 
-        while (! $body->eof()) {
-            $buffer .= $body->read(8192);
+        if (! is_resource($stream)) {
+            return;
+        }
 
-            while (($newlinePosition = strpos($buffer, "\n")) !== false) {
-                $line = substr($buffer, 0, $newlinePosition);
-                $buffer = substr($buffer, $newlinePosition + 1);
+        // PHP fills its read buffer up to `chunk_size` before handing anything
+        // back, so at the default 8192 a reply that trickles out one small JSON
+        // object at a time is held until the endpoint hangs up — and the entire
+        // answer then lands at once, however well the rest of the pipeline
+        // streams. Reading a byte at a time costs nothing that matters against a
+        // model's own pace, and makes each line readable the moment it lands.
+        stream_set_chunk_size($stream, 1);
+
+        try {
+            while (! feof($stream)) {
+                $line = fgets($stream);
+
+                if ($line === false) {
+                    break;
+                }
 
                 $chunk = $this->extractChunk($line, $extractor);
 
@@ -253,12 +265,9 @@ class OllamaClient
                     yield $chunk;
                 }
             }
-        }
-
-        $chunk = $this->extractChunk($buffer, $extractor);
-
-        if ($chunk !== null && $chunk !== '') {
-            yield $chunk;
+        } finally {
+            // The body was detached, so nothing else is going to close it.
+            fclose($stream);
         }
     }
 
