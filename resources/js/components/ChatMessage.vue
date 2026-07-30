@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { Bot, Check, Copy, User } from '@lucide/vue';
 import { computed, onUnmounted, ref, watch } from 'vue';
+import MarkdownContent from '@/components/MarkdownContent.vue';
 
 export interface ChatMessageData {
     role: 'user' | 'assistant';
@@ -144,21 +145,26 @@ async function writeToClipboard(text: string): Promise<boolean> {
 
         <div class="max-w-[80%] space-y-1">
             <div
-                class="rounded-2xl px-4 py-2 text-sm whitespace-pre-wrap"
+                class="rounded-2xl px-4 py-2 text-sm"
                 :class="[
                     message.role === 'user'
-                        ? 'bg-primary text-primary-foreground'
+                        ? 'bg-primary whitespace-pre-wrap text-primary-foreground'
                         : 'bg-muted',
                     message.status === 'error' ? 'text-destructive' : '',
                 ]"
             >
-                {{ message.content
-                }}<span
-                    v-if="isLive"
-                    class="ml-0.5 inline-block w-[0.5em] animate-pulse bg-current align-text-bottom"
-                    aria-hidden="true"
-                    >&nbsp;</span
-                >
+                <!--
+                    A reply is Markdown; a prompt is whatever the user typed, and
+                    is shown as typed.
+                -->
+                <template v-if="message.role === 'user'">{{
+                    message.content
+                }}</template>
+                <MarkdownContent
+                    v-else
+                    :source="message.content"
+                    :live="isLive"
+                />
             </div>
 
             <div

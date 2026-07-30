@@ -13,6 +13,8 @@ import {
     X,
 } from '@lucide/vue';
 import { computed, nextTick, onUnmounted, reactive, ref, watch } from 'vue';
+import { toast } from 'vue-sonner';
+import ChatCommandMenu from '@/components/ChatCommandMenu.vue';
 import ChatMessage from '@/components/ChatMessage.vue';
 import StatusDot from '@/components/StatusDot.vue';
 import { Button } from '@/components/ui/button';
@@ -31,6 +33,8 @@ import {
     SelectValue,
 } from '@/components/ui/select';
 import { useChatStream } from '@/composables/useChatStream';
+import type { ChatCommand, ChatCommandName } from '@/lib/chatCommands';
+import { matchCommands, parseCommand } from '@/lib/chatCommands';
 import { index as chatIndex, stream as chatStream } from '@/routes/chat';
 import {
     clear as clearConversations,
@@ -134,6 +138,8 @@ const pinnedToBottom = ref(true);
 const options = reactive({ ...defaultOptions });
 const renamingId = ref<number | null>(null);
 const renameDraft = ref('');
+const activeCommand = ref(0);
+const commandMenuDismissed = ref(false);
 
 const selectedDomain = computed(
     () => props.domains.find((d) => d.id === selectedDomainId.value) ?? null,
@@ -225,13 +231,37 @@ const { isStreaming, isFetching, send, cancel } = useChatStream(
 
 const busy = computed(() => isStreaming.value || isFetching.value);
 
+/** The command the composer holds, if it holds one rather than a prompt. */
+const invocation = computed(() => parseCommand(prompt.value));
+
+const commandMatches = computed(() =>
+    commandMenuDismissed.value ? [] : matchCommands(prompt.value),
+);
+
+const commandMenuOpen = computed(() => commandMatches.value.length > 0);
+
 const canSend = computed(
     () =>
-        !busy.value &&
-        !!selectedDomainId.value &&
-        !!selectedModel.value &&
-        prompt.value.trim().length > 0,
+        invocation.value !== null ||
+        (!busy.value &&
+            !!selectedDomainId.value &&
+            !!selectedModel.value &&
+            prompt.value.trim().length > 0),
 );
+
+// Escape closes the menu; clearing the slash brings it back.
+watch(prompt, (value) => {
+    if (!value.startsWith('/')) {
+        commandMenuDismissed.value = false;
+    }
+});
+
+watch(commandMatches, (matches) => {
+    activeCommand.value = Math.min(
+        activeCommand.value,
+        Math.max(matches.length - 1, 0),
+    );
+});
 
 /** Text received but not yet written to the thread. Deliberately not reactive. */
 let chunkBuffer = '';
@@ -418,6 +448,16 @@ function generationPayload(): Record<string, unknown> {
 }
 
 function submit() {
+    const call = invocation.value;
+
+    // A command is carried out here rather than sent anywhere.
+    if (call !== null) {
+        prompt.value = '';
+        runCommand(call.command.name, call.argument);
+
+        return;
+    }
+
     if (!canSend.value) {
         return;
     }
@@ -544,10 +584,27 @@ function saveRename(id: number) {
         return;
     }
 
+    patchTitle(id, title);
+}
+
+/**
+ * Retitle a conversation. The sidebar edit is its own feedback; a command needs
+ * telling, since nothing else on screen moves.
+ */
+function patchTitle(id: number, title: string, notify = false) {
     router.patch(
         renameConversation(id).url,
         { title },
-        { preserveScroll: true, preserveState: true, only: ['conversations'] },
+        {
+            preserveScroll: true,
+            preserveState: true,
+            only: ['conversations'],
+            onSuccess: () => {
+                if (notify) {
+                    toast.success(`Renamed to “${title}”.`);
+                }
+            },
+        },
     );
 }
 
@@ -590,10 +647,207 @@ function resetOptions() {
 }
 
 function onPromptKeydown(event: KeyboardEvent) {
+    if (commandMenuOpen.value && onCommandMenuKeydown(event)) {
+        return;
+    }
+
     if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
         submit();
     }
+}
+
+/**
+ * Drive the command menu from the composer. Reports whether the key was ours,
+ * so anything else still reaches the textarea.
+ */
+function onCommandMenuKeydown(event: KeyboardEvent): boolean {
+    const last = commandMatches.value.length - 1;
+
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        const step = event.key === 'ArrowDown' ? 1 : -1;
+        const next = activeCommand.value + step;
+
+        event.preventDefault();
+        activeCommand.value = next < 0 ? last : next > last ? 0 : next;
+
+        return true;
+    }
+
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        commandMenuDismissed.value = true;
+
+        return true;
+    }
+
+    if (event.key !== 'Enter' && event.key !== 'Tab') {
+        return false;
+    }
+
+    const command = commandMatches.value[activeCommand.value];
+
+    if (command === undefined) {
+        return false;
+    }
+
+    event.preventDefault();
+    chooseCommand(command);
+
+    return true;
+}
+
+/**
+ * Take a command from the menu: run it outright, or write it into the composer
+ * so its argument can be typed.
+ */
+function chooseCommand(command: ChatCommand) {
+    activeCommand.value = 0;
+
+    if (command.argument === null) {
+        prompt.value = '';
+        runCommand(command.name, '');
+
+        return;
+    }
+
+    prompt.value = `/${command.name} `;
+    commandMenuDismissed.value = false;
+}
+
+function runCommand(name: ChatCommandName, argument: string) {
+    switch (name) {
+        case 'help':
+            // The menu *is* the list, so put the composer back into it.
+            prompt.value = '/';
+            activeCommand.value = 0;
+            commandMenuDismissed.value = false;
+            break;
+
+        case 'new':
+            newChat();
+            break;
+
+        case 'temporary':
+            toggleTemporary();
+            toast.info(
+                temporary.value
+                    ? 'Temporary chat on — this thread is not saved.'
+                    : 'Temporary chat off.',
+            );
+            break;
+
+        case 'stop':
+            if (busy.value) {
+                stopStream();
+            }
+
+            break;
+
+        case 'model':
+            selectModelNamed(argument);
+            break;
+
+        case 'domain':
+            selectDomainHosted(argument);
+            break;
+
+        case 'system':
+            options.system = argument;
+            toast.success(
+                argument === ''
+                    ? 'System prompt cleared.'
+                    : 'System prompt set.',
+            );
+            break;
+
+        case 'rename':
+            renameOpenConversation(argument);
+            break;
+    }
+}
+
+/** Switch model by name, or by enough of one to be unambiguous. */
+function selectModelNamed(name: string) {
+    if (name === '') {
+        toast.error('Usage: /model <name>');
+
+        return;
+    }
+
+    const models = selectedDomain.value?.models ?? [];
+    const match = findByName(
+        models.map((model) => model.name),
+        name,
+    );
+
+    if (match === null) {
+        toast.error(`This endpoint serves no model matching “${name}”.`);
+
+        return;
+    }
+
+    selectedModel.value = match;
+    toast.success(`Model set to ${match}.`);
+}
+
+/** Switch endpoint by host, or by part of one. */
+function selectDomainHosted(host: string) {
+    if (host === '') {
+        toast.error('Usage: /domain <host>');
+
+        return;
+    }
+
+    const match = findByName(
+        props.domains.map((domain) => domain.host),
+        host,
+    );
+    const domain = props.domains.find((candidate) => candidate.host === match);
+
+    if (domain === undefined) {
+        toast.error(`No active endpoint matches “${host}”.`);
+
+        return;
+    }
+
+    // The model watcher picks a model this endpoint actually serves.
+    selectedDomainId.value = domain.id;
+    toast.success(`Endpoint set to ${domain.host}.`);
+}
+
+function renameOpenConversation(title: string) {
+    if (conversationId.value === null) {
+        toast.error('This chat has not been saved yet, so it has no title.');
+
+        return;
+    }
+
+    if (title === '') {
+        toast.error('Usage: /rename <title>');
+
+        return;
+    }
+
+    patchTitle(conversationId.value, title, true);
+}
+
+/**
+ * The best of an exact match, a prefix, then anything containing the text.
+ */
+function findByName(candidates: string[], text: string): string | null {
+    const needle = text.toLowerCase();
+    const lowered = candidates.map((candidate) => candidate.toLowerCase());
+    const exact = lowered.indexOf(needle);
+    const prefix = lowered.findIndex((candidate) =>
+        candidate.startsWith(needle),
+    );
+    const anywhere = lowered.findIndex((candidate) =>
+        candidate.includes(needle),
+    );
+    const index = exact !== -1 ? exact : prefix !== -1 ? prefix : anywhere;
+
+    return index === -1 ? null : candidates[index];
 }
 
 /** Follow the stream only while the reader is already at the bottom. */
@@ -917,11 +1171,19 @@ async function stickToBottom() {
 
             <!-- Composer -->
             <div class="border-t p-3">
+                <ChatCommandMenu
+                    v-if="commandMenuOpen"
+                    :commands="commandMatches"
+                    :active="activeCommand"
+                    @activate="activeCommand = $event"
+                    @select="chooseCommand"
+                />
+
                 <div class="flex items-end gap-2">
                     <textarea
                         v-model="prompt"
                         rows="1"
-                        placeholder="Message the model…  (Enter to send, Shift+Enter for newline)"
+                        placeholder="Message the model…  (Enter to send, / for commands)"
                         class="max-h-40 min-h-11 flex-1 resize-none rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
                         @keydown="onPromptKeydown"
                     />
