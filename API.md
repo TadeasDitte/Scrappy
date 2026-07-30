@@ -109,9 +109,13 @@ Single-prompt completion.
 | `prompt` | yes | Max 8000 characters |
 | `system` | no | Max 4000 characters |
 | `stream` | no | Default `true` |
+| `keep_alive` | no | How long the host holds the model in memory, e.g. `10m` |
 | `options` | no | See [Generation options](#generation-options) |
 
-Streamed (default) — the body is `text/plain`, written as the model produces it:
+Streamed (default) — the body is `text/plain`, written as the model produces it.
+Chunk boundaries are **not** token boundaries: writes are coalesced into batches
+of up to 512 bytes or 50 ms to keep frame counts sane, so concatenate what you
+read rather than treating each chunk as a unit.
 
 ```bash
 curl -N -H "Authorization: Bearer $TOKEN" \
@@ -153,8 +157,11 @@ replaced by `messages`:
 | `messages[].role` | yes | `system`, `user` or `assistant` |
 | `messages[].content` | yes | Max 8000 characters |
 
-If `system` is also supplied it is prepended to `messages` as a system turn.
-Streams by default, `"stream": false` for the blocking form.
+`system`, `stream`, `keep_alive` and `options` behave exactly as they do on
+`chat/generate`; a `system` prompt is prepended to `messages` as a system turn.
+
+The API is stateless: it never reads or writes the conversation history kept by
+the web UI. Send the turns you want the model to see on every request.
 
 ```bash
 curl -N -H "Authorization: Bearer $TOKEN" \

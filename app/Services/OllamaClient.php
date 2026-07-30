@@ -10,6 +10,18 @@ use Illuminate\Support\Facades\Http;
 class OllamaClient
 {
     /**
+     * Flush a batch once this many bytes have piled up.
+     */
+    protected const int BATCH_BYTES = 512;
+
+    /**
+     * ...or this long has passed, whichever comes first. Anything slower than
+     * ~20 tokens/second therefore streams token by token as before; only a
+     * model fast enough to outrun the display gets batched.
+     */
+    protected const float BATCH_SECONDS = 0.05;
+
+    /**
      * Probe a domain's `/api/tags` endpoint.
      *
      * Returns the decoded `models` array on a legitimate Ollama response, or
@@ -44,14 +56,14 @@ class OllamaClient
      * @param  array<string, mixed>  $options
      * @return Generator<int, string>
      */
-    public function generateStream(Domain $domain, string $model, string $prompt, array $options = [], ?string $system = null): Generator
+    public function generateStream(Domain $domain, string $model, string $prompt, array $options = [], ?string $system = null, ?string $keepAlive = null): Generator
     {
-        yield from $this->streamNdjson(
+        yield from $this->batched($this->streamNdjson(
             $domain,
             '/api/generate',
-            $this->generatePayload($model, $prompt, $options, $system, stream: true),
+            $this->generatePayload($model, $prompt, $options, $system, $keepAlive, stream: true),
             fn (array $decoded): ?string => $this->stringOrNull($decoded['response'] ?? null),
-        );
+        ));
     }
 
     /**
@@ -60,12 +72,12 @@ class OllamaClient
      * @param  array<string, mixed>  $options
      * @return array{response: string, done_reason: string|null, metrics: array<string, int|float|null>}
      */
-    public function generate(Domain $domain, string $model, string $prompt, array $options = [], ?string $system = null): array
+    public function generate(Domain $domain, string $model, string $prompt, array $options = [], ?string $system = null, ?string $keepAlive = null): array
     {
         $decoded = $this->postJson(
             $domain,
             '/api/generate',
-            $this->generatePayload($model, $prompt, $options, $system, stream: false),
+            $this->generatePayload($model, $prompt, $options, $system, $keepAlive, stream: false),
         );
 
         return [
@@ -82,14 +94,14 @@ class OllamaClient
      * @param  array<string, mixed>  $options
      * @return Generator<int, string>
      */
-    public function chatStream(Domain $domain, string $model, array $messages, array $options = []): Generator
+    public function chatStream(Domain $domain, string $model, array $messages, array $options = [], ?string $keepAlive = null): Generator
     {
-        yield from $this->streamNdjson(
+        yield from $this->batched($this->streamNdjson(
             $domain,
             '/api/chat',
-            $this->chatPayload($model, $messages, $options, stream: true),
+            $this->chatPayload($model, $messages, $options, $keepAlive, stream: true),
             fn (array $decoded): ?string => $this->stringOrNull($decoded['message']['content'] ?? null),
-        );
+        ));
     }
 
     /**
@@ -99,12 +111,12 @@ class OllamaClient
      * @param  array<string, mixed>  $options
      * @return array{response: string, done_reason: string|null, metrics: array<string, int|float|null>}
      */
-    public function chat(Domain $domain, string $model, array $messages, array $options = []): array
+    public function chat(Domain $domain, string $model, array $messages, array $options = [], ?string $keepAlive = null): array
     {
         $decoded = $this->postJson(
             $domain,
             '/api/chat',
-            $this->chatPayload($model, $messages, $options, stream: false),
+            $this->chatPayload($model, $messages, $options, $keepAlive, stream: false),
         );
 
         return [
@@ -120,13 +132,14 @@ class OllamaClient
      * @param  array<string, mixed>  $options
      * @return array<string, mixed>
      */
-    protected function generatePayload(string $model, string $prompt, array $options, ?string $system, bool $stream): array
+    protected function generatePayload(string $model, string $prompt, array $options, ?string $system, ?string $keepAlive, bool $stream): array
     {
         return array_filter([
             'model' => $model,
             'prompt' => $prompt,
             'system' => $system,
             'stream' => $stream,
+            'keep_alive' => $keepAlive,
             'options' => $options === [] ? null : $options,
         ], fn ($value): bool => $value !== null);
     }
@@ -138,12 +151,13 @@ class OllamaClient
      * @param  array<string, mixed>  $options
      * @return array<string, mixed>
      */
-    protected function chatPayload(string $model, array $messages, array $options, bool $stream): array
+    protected function chatPayload(string $model, array $messages, array $options, ?string $keepAlive, bool $stream): array
     {
         return array_filter([
             'model' => $model,
             'messages' => array_values($messages),
             'stream' => $stream,
+            'keep_alive' => $keepAlive,
             'options' => $options === [] ? null : $options,
         ], fn ($value): bool => $value !== null);
     }
@@ -162,6 +176,52 @@ class OllamaClient
         $decoded = $response->json();
 
         return is_array($decoded) ? $decoded : [];
+    }
+
+    /**
+     * Group tiny chunks into fewer, larger ones.
+     *
+     * Ollama emits one JSON object per token, and forwarding each of them
+     * individually costs a flush, a chunked-transfer frame and — at the far end
+     * — a re-render, several hundred times per reply. Batching collapses that
+     * by an order of magnitude while staying invisible: the first token is
+     * always passed straight through, and a batch never waits longer than
+     * BATCH_SECONDS, so a slow model still trickles out token by token.
+     *
+     * @param  Generator<int, string>  $chunks
+     * @return Generator<int, string>
+     */
+    protected function batched(Generator $chunks): Generator
+    {
+        $buffer = '';
+        $flushAt = 0.0;
+        $isFirst = true;
+
+        foreach ($chunks as $chunk) {
+            // Time to first token is what a reader actually feels; never delay it.
+            if ($isFirst) {
+                $isFirst = false;
+                $flushAt = microtime(true) + static::BATCH_SECONDS;
+
+                yield $chunk;
+
+                continue;
+            }
+
+            $buffer .= $chunk;
+
+            if (strlen($buffer) >= static::BATCH_BYTES || microtime(true) >= $flushAt) {
+                $flushAt = microtime(true) + static::BATCH_SECONDS;
+
+                yield $buffer;
+
+                $buffer = '';
+            }
+        }
+
+        if ($buffer !== '') {
+            yield $buffer;
+        }
     }
 
     /**

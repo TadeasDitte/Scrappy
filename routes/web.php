@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\ChatController;
+use App\Http\Controllers\ConversationController;
 use App\Http\Controllers\DashboardController;
 use App\Http\Controllers\DomainController;
 use App\Http\Controllers\RefreshController;
@@ -17,6 +18,10 @@ Route::middleware(['auth', 'verified'])->group(function () {
 
     Route::get('chat', [ChatController::class, 'index'])->name('chat.index');
     Route::post('chat/stream', [ChatController::class, 'stream'])->name('chat.stream');
+
+    Route::patch('chat/conversations/{conversation}', [ConversationController::class, 'update'])->name('conversations.update');
+    Route::delete('chat/conversations/{conversation}', [ConversationController::class, 'destroy'])->name('conversations.destroy');
+    Route::delete('chat/conversations', [ConversationController::class, 'clear'])->name('conversations.clear');
 });
 
 require __DIR__.'/settings.php';

@@ -1,4 +1,4 @@
-# Scrappy
+# Scrappy [Everything in this repo was done by Claude, i didnt want to spend the time to make this but wanted to have this]
 
 Scrappy discovers public Ollama endpoints, checks which ones are actually
 answering, ranks them by response time, and gives you a chat UI and a token
@@ -113,7 +113,62 @@ Two things keep tokens flowing instead of arriving in one lump at the end:
    and responses carry `X-Accel-Buffering: no`.
 
 The chat UI consumes this with `useStream` from `@laravel/stream-vue` and
-appends each chunk on arrival, so the thread paints as the model types.
+appends each chunk on arrival, so the thread paints as the model types. While
+nothing has arrived yet the assistant bubble counts up (`waiting for first
+token… 4.2s`) — a cold model can take a while to produce its first byte, and
+that should read as *working*, not *frozen*.
+
+Two things keep a fast model from feeling slower in the browser than it is on
+the wire:
+
+- **Chunks are batched** (`OllamaClient::batched`). Ollama emits one JSON
+  object per token; forwarding each individually costs a flush, a
+  chunked-transfer frame and a re-render, several hundred times per reply.
+  Batches flush at 512 bytes or every 50 ms, whichever comes first, which cut a
+  measured 3000-token reply from ~800 frames to ~55 with identical bytes. The
+  first token is always passed straight through, and anything slower than ~20
+  tokens/second still streams token by token — a 400 ms/token model measures
+  the same before and after.
+- **The browser writes once per animation frame.** Incoming text lands in a
+  plain buffer and is committed to the reactive thread on the next frame, and
+  each message renders through its own component, so a token updates one bubble
+  instead of the whole conversation.
+
+> **Changing frontend code?** The Docker image bakes `npm run build` in at
+> build time (`Dockerfile`), so `docker compose up -d` alone will keep serving
+> the old bundle. Use `docker compose up -d --build`, or run `npm run dev` for
+> Vite in front of a local server.
+
+## Chat
+
+The chat page keeps a history sidebar. The first prompt in a thread creates a
+conversation titled from that prompt; both turns are stored, and the response
+header `X-Conversation-Id` lets the open thread adopt its new id without an
+extra round trip. Conversations can be renamed, deleted individually, or
+cleared in bulk.
+
+Follow-up prompts replay the stored transcript to the endpoint through Ollama's
+`/api/chat`, so the model has context. A thread's very first message still goes
+to `/api/generate`. Saved conversations always build that context from the
+database rather than from anything the browser sends.
+
+**Temporary mode** (the ghost button) streams a thread that is never written
+down: no conversation row, no messages, nothing in the sidebar. Context is kept
+client-side and sent with each prompt so the model still follows along, and a
+`conversation_id` supplied alongside `temporary` is ignored. Toggling the mode
+either way starts a clean thread, so a temporary chat can never inherit — or
+leak into — a saved one.
+
+Per-request generation options (system prompt, temperature, top P, max tokens,
+seed, stop sequences, keep-alive) live behind **Options** in the thread header
+and use the same validation as the API.
+
+**Keep model loaded** sets Ollama's `keep_alive`. Hosts unload an idle model
+after a few minutes, and the next message then pays for a full load from disk —
+often the single biggest reason a follow-up feels far slower than the same
+prompt run twice through `curl`. Setting it to something like `10m` keeps the
+model resident. It is left unset by default: these are other people's machines,
+and pinning a model in their memory should be a deliberate choice.
 
 ## API
 

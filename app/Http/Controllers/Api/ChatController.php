@@ -26,17 +26,18 @@ class ChatController extends Controller
         $prompt = $request->string('prompt')->value();
         $options = $request->generationOptions();
         $system = $request->validated('system');
+        $keepAlive = $request->keepAlive();
 
         if (! $request->shouldStream()) {
             return $this->completion(
-                fn (): array => $ollama->generate($domain, $model, $prompt, $options, $system),
+                fn (): array => $ollama->generate($domain, $model, $prompt, $options, $system, $keepAlive),
                 $domain,
                 $model,
             );
         }
 
         return $this->streamed(
-            fn (): Generator => yield from $ollama->generateStream($domain, $model, $prompt, $options, $system),
+            fn (): Generator => yield from $ollama->generateStream($domain, $model, $prompt, $options, $system, $keepAlive),
         );
     }
 
@@ -52,17 +53,18 @@ class ChatController extends Controller
         $model = $request->model();
         $messages = $request->conversation();
         $options = $request->generationOptions();
+        $keepAlive = $request->keepAlive();
 
         if (! $request->shouldStream()) {
             return $this->completion(
-                fn (): array => $ollama->chat($domain, $model, $messages, $options),
+                fn (): array => $ollama->chat($domain, $model, $messages, $options, $keepAlive),
                 $domain,
                 $model,
             );
         }
 
         return $this->streamed(
-            fn (): Generator => yield from $ollama->chatStream($domain, $model, $messages, $options),
+            fn (): Generator => yield from $ollama->chatStream($domain, $model, $messages, $options, $keepAlive),
         );
     }
 

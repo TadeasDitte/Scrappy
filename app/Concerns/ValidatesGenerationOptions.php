@@ -53,6 +53,13 @@ trait ValidatesGenerationOptions
         $rules = [
             'system' => ['sometimes', 'nullable', 'string', 'max:4000'],
             'stream' => ['sometimes', 'boolean'],
+            // How long the host should hold the model in memory after replying:
+            // a duration like "10m", or seconds. Keeping it loaded is the
+            // difference between a follow-up answering instantly and paying for
+            // a full model load again.
+            // \z, not $: PCRE's $ also matches before a trailing newline, and
+            // Ollama rejects "10m\n" as an unparseable duration.
+            'keep_alive' => ['sometimes', 'nullable', 'string', 'max:16', 'regex:/\A-?\d+(\.\d+)?(ms|s|m|h)?\z/'],
             'options' => ['sometimes', 'array', $this->rejectsUnknownOptions()],
             'options.stop' => ['sometimes', 'array', 'max:4'],
             'options.stop.*' => ['string', 'min:1', 'max:64'],
@@ -91,6 +98,16 @@ trait ValidatesGenerationOptions
         }
 
         return $options;
+    }
+
+    /**
+     * How long the endpoint should keep the model loaded, if the caller said.
+     */
+    public function keepAlive(): ?string
+    {
+        $keepAlive = $this->validated('keep_alive');
+
+        return is_string($keepAlive) && $keepAlive !== '' ? $keepAlive : null;
     }
 
     /**
